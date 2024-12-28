@@ -11,5 +11,5 @@ head_sampling_rate = 1
 
 [vars]
 USER_ID = "9a6e3c94-3bbc-4cc6-accb-acdd7e202fba"
-PROXY_IP = "gh.proxy.farelra.my.id"
+PROXY_IP = ""
 FALLBACK_SITE = "https://ifconfig.me"
