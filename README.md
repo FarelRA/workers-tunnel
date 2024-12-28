@@ -11,7 +11,7 @@ A lightweight edge network tunnel implemented using Cloudflare Workers, leveragi
 
 ## Getting Started
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zhu327/workers-tunnel/tree/main)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/FarelRA/workers-tunnel/tree/main)
 
 ### Prerequisites
 
