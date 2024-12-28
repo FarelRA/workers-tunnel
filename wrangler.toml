@@ -1,4 +1,4 @@
-name = "tunnel"
+name = "workers-tunnel"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-09-02"
 
