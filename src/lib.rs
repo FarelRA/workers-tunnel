@@ -16,20 +16,6 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
 
-    // better disguising
-    let fallback_site = match env.var("FALLBACK_SITE") {
-        Ok(f) => f.to_string(),
-        Err(_) => String::from(""),
-    };
-    let should_fallback = match req.headers().get("Upgrade")? {
-        Some(up) => up != *"websocket",
-        None => true,
-    };
-    if should_fallback && !fallback_site.is_empty() {
-        let req = Fetch::Url(Url::parse(&fallback_site)?);
-        return req.send().await;
-    }
-
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
@@ -108,7 +94,7 @@ mod proxy {
 
         let mut bytes = Vec::new();
         while let (Some(h), Some(l)) = (hex_bytes.next(), hex_bytes.next()) {
-            bytes.push((h << 4) | l)
+            bytes.push(h << 4 | l)
         }
         bytes
     }
@@ -160,7 +146,7 @@ mod proxy {
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
                 // try to connect to remote
-                for target in [vec![remote_addr], proxy_ip].concat() {
+                for target in vec![vec![remote_addr], proxy_ip].concat() {
                     match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
                         Ok(_) => {
                             // normal closed
@@ -263,7 +249,7 @@ mod proxy {
         loop {
             // read packet length
             let length = client_socket.read_u16().await;
-            if length.is_err() {
+            if let Err(_) = length {
                 return Ok(());
             }
 
@@ -374,7 +360,7 @@ mod websocket {
         }
     }
 
-    impl AsyncRead for WebSocketStream<'_> {
+    impl<'a> AsyncRead for WebSocketStream<'a> {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -406,7 +392,7 @@ mod websocket {
         }
     }
 
-    impl AsyncWrite for WebSocketStream<'_> {
+    impl<'a> AsyncWrite for WebSocketStream<'a> {
         fn poll_write(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
