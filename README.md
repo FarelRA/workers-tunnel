@@ -41,11 +41,13 @@ A lightweight edge network tunnel implemented using Cloudflare Workers, leveragi
 
 3. **Configure `wrangler.toml`:**
    - Open the `wrangler.toml` file.
-   -  Locate the `[vars]` section and set the `USER_ID` to your desired UUID (required for vless authentication).
+   -  Locate the `[vars]` section and set the required variables.
 
      ```toml
      [vars]
-     USER_ID = "your-uuid-here" # Replace with your UUID
+     USER_ID = "your-uuid-here" # Replace with your UUID (required for vless authentication)
+	 PROXY_IP = "your-ip-or-domain" # If not empty used when connecting to a Cloudflare IPs
+     FALLBACK_SITE = "your-url" # If not empty used when not "Upgrade" header set
      ```
 
 4. **Development:** Start the development server to test your worker:
