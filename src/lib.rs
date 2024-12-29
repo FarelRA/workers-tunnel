@@ -1,132 +1,105 @@
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel};
 use crate::websocket::WebSocketStream;
-use std::time::Duration;
 use worker::*;
 
-const TUNNEL_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes timeout
-const MAX_BUFFER_SIZE: usize = 32 * 1024; // 32KB buffer limit
-
 #[event(fetch)]
-async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    // Set a deadline for the entire worker
-    ctx.wait_until(async {
-        tokio::time::sleep(TUNNEL_TIMEOUT).await;
-    });
+async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
+    // Add timeout to prevent infinite hanging
+    let timeout = std::time::Duration::from_secs(50); // Cloudflare's limit is 60s
+    let response = tokio::time::timeout(timeout, handle_request(req, env)).await;
 
-    // Parse configuration
-    let config = match parse_config(&env) {
-        Ok(config) => config,
-        Err(e) => return Response::error(format!("Configuration error: {}", e), 500),
-    };
-
-    // Handle fallback if needed
-    if should_fallback(&req, &config.fallback_site)? {
-        return handle_fallback(&config.fallback_site).await;
+    match response {
+        Ok(result) => result,
+        Err(_) => Response::error("Worker timed out", 504),
     }
-
-    // Handle WebSocket connection
-    handle_websocket(req, config).await
 }
 
-struct Config {
-    user_id: Vec<u8>,
-    proxy_ip: Vec<String>,
-    fallback_site: String,
-}
-
-fn parse_config(env: &Env) -> Result<Config> {
-    let user_id = env
-        .var("USER_ID")
-        .map_err(|e| format!("USER_ID not set: {}", e))?
-        .to_string();
+async fn handle_request(req: Request, env: Env) -> Result<Response> {
+    // get user id
+    let user_id = env.var("USER_ID")?.to_string();
     let user_id = parse_user_id(&user_id);
 
-    let proxy_ip = env
-        .var("PROXY_IP")
-        .map_err(|e| format!("PROXY_IP not set: {}", e))?
-        .to_string();
+    // get proxy ip list
+    let proxy_ip = env.var("PROXY_IP")?.to_string();
     let proxy_ip = proxy_ip
         .split_ascii_whitespace()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .collect();
+        .collect::<Vec<String>>();
 
-    let fallback_site = env
-        .var("FALLBACK_SITE")
-        .map(|f| f.to_string())
-        .unwrap_or_default();
-
-    Ok(Config {
-        user_id,
-        proxy_ip,
-        fallback_site,
-    })
-}
-
-fn should_fallback(req: &Request, fallback_site: &str) -> Result<bool> {
-    if fallback_site.is_empty() {
-        return Ok(false);
-    }
+    // better disguising
+    let fallback_site = match env.var("FALLBACK_SITE") {
+        Ok(f) => f.to_string(),
+        Err(_) => String::from(""),
+    };
     
-    match req.headers().get("Upgrade")? {
-        Some(up) => Ok(up != *"websocket"),
-        None => Ok(true),
-    }
-}
-
-async fn handle_fallback(fallback_site: &str) -> Result<Response> {
-    let req = Fetch::Url(Url::parse(fallback_site)?);
-    req.send().await
-}
-
-async fn handle_websocket(req: Request, config: Config) -> Result<Response> {
-    // Parse early data
-    let early_data = match req.headers().get("sec-websocket-protocol")? {
-        Some(protocol) => parse_early_data(Some(protocol))?,
-        None => None,
+    // Check for websocket upgrade
+    let is_websocket = match req.headers().get("Upgrade")? {
+        Some(up) => up.eq_ignore_ascii_case("websocket"),
+        None => false,
     };
 
-    // Create WebSocket pair
-    let pair = WebSocketPair::new()?;
-    let server = pair.server;
-    let client = pair.client;
+    if !is_websocket && !fallback_site.is_empty() {
+        let req = Fetch::Url(Url::parse(&fallback_site)?);
+        return req.send().await;
+    }
 
-    // Accept connection
-    server.accept()?;
+    // ready early data
+    let early_data = req.headers().get("sec-websocket-protocol")?;
+    let early_data = parse_early_data(early_data)?;
 
-    // Spawn tunnel handler
-    wasm_bindgen_futures::spawn_local(async move {
-        let result = handle_tunnel(&server, early_data, config).await;
-        
+    // Accept websocket connection with proper error handling
+    let pair = WebSocketPair::new().map_err(|e| {
+        console_error!("Failed to create WebSocket pair: {}", e);
+        Error::from(e)
+    })?;
+    
+    let WebSocketPair { client, server } = pair;
+    
+    server.accept().map_err(|e| {
+        console_error!("Failed to accept WebSocket connection: {}", e);
+        Error::from(e)
+    })?;
+
+    // Use a separate task for connection handling
+    let handle = wasm_bindgen_futures::spawn_local(async move {
+        let result = handle_connection(&server, early_data, user_id, proxy_ip).await;
         if let Err(err) = result {
-            console_error!("Tunnel error: {}", err);
-            let _ = server.close(Some(1011), Some(&err.to_string()));
+            console_error!("Connection error: {}", err);
+            // Ensure connection is properly closed on error
+            let _ = server.close(Some(1011), Some(&format!("Error: {}", err)));
         }
     });
 
+    // Return client socket immediately
     Response::from_websocket(client)
 }
 
-async fn handle_tunnel(
+async fn handle_connection(
     server: &WebSocket,
     early_data: Option<Vec<u8>>,
-    config: Config,
+    user_id: Vec<u8>,
+    proxy_ip: Vec<String>,
 ) -> Result<()> {
-    let events = server.events().map_err(|e| format!("Failed to get server events: {}", e))?;
-    let socket = WebSocketStream::new(server, events, early_data);
+    // Create websocket stream with proper error handling
+    let socket = match server.events() {
+        Ok(events) => WebSocketStream::new(server, events, early_data),
+        Err(e) => {
+            console_error!("Failed to get WebSocket events: {}", e);
+            return Err(Error::from(e));
+        }
+    };
 
-    match tokio::time::timeout(
-        TUNNEL_TIMEOUT,
-        run_tunnel(socket, config.user_id, config.proxy_ip),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(Error::new(
-            std::io::ErrorKind::TimedOut,
-            "Tunnel timed out",
-        )),
+    // Run tunnel with proper cleanup
+    let result = run_tunnel(socket, user_id, proxy_ip).await;
+    
+    // Ensure proper cleanup on error
+    if let Err(ref e) = result {
+        console_error!("Tunnel error: {}", e);
+        let _ = server.close(Some(1011), Some(&format!("Tunnel error: {}", e)));
     }
+    
+    result
 }
 
 #[allow(dead_code)]
@@ -138,43 +111,27 @@ mod protocol {
     pub const ADDRESS_TYPE_IPV4: u8 = 1;
     pub const ADDRESS_TYPE_DOMAIN: u8 = 2;
     pub const ADDRESS_TYPE_IPV6: u8 = 3;
-    
-    // Added new constants for error handling
-    pub const ERROR_TIMEOUT: u16 = 1001;
-    pub const ERROR_INVALID_DATA: u16 = 1002;
-    pub const ERROR_CONNECTION_FAILED: u16 = 1003;
 }
 
 mod proxy {
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     use crate::ext::StreamExt;
     use crate::protocol;
     use crate::websocket::WebSocketStream;
     use base64::{decode_config, URL_SAFE_NO_PAD};
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-    use tokio::time::timeout;
     use worker::*;
-
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
             if !data.is_empty() {
                 let s = data.replace('+', "-").replace('/', "_").replace("=", "");
                 match decode_config(s, URL_SAFE_NO_PAD) {
-                    Ok(early_data) => {
-                        if early_data.len() > crate::MAX_BUFFER_SIZE {
-                            return Err(Error::new(
-                                ErrorKind::InvalidData,
-                                "Early data exceeds maximum buffer size",
-                            ));
-                        }
-                        return Ok(Some(early_data));
-                    }
+                    Ok(early_data) => return Ok(Some(early_data)),
                     Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
                 }
             }
@@ -194,7 +151,7 @@ mod proxy {
             })
             .fuse();
 
-        let mut bytes = Vec::with_capacity(16); // Pre-allocate for expected size
+        let mut bytes = Vec::new();
         while let (Some(h), Some(l)) = (hex_bytes.next(), hex_bytes.next()) {
             bytes.push((h << 4) | l)
         }
@@ -206,199 +163,193 @@ mod proxy {
         user_id: Vec<u8>,
         proxy_ip: Vec<String>,
     ) -> Result<()> {
-        // Validate protocol version
+        // Add connection state tracking
+        let is_connected = Arc::new(AtomicBool::new(true));
+        let is_connected_clone = is_connected.clone();
+
+        // Cleanup handler
+        let _cleanup = defer::defer(move || {
+            is_connected_clone.store(false, Ordering::SeqCst);
+        });
+
+        // read version
         if client_socket.read_u8().await? != protocol::VERSION {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid protocol version"));
+            return Err(Error::new(ErrorKind::InvalidData, "invalid version"));
         }
 
-        // Verify user ID
-        let received_user_id = client_socket.read_bytes(16).await?;
-        if received_user_id != user_id {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid user ID"));
+        // verify user_id
+        if client_socket.read_bytes(16).await? != user_id {
+            return Err(Error::new(ErrorKind::InvalidData, "invalid user id"));
         }
 
-        // Read and validate addons length
+        // ignore addons
         let length = client_socket.read_u8().await?;
-        if length as usize > crate::MAX_BUFFER_SIZE {
-            return Err(Error::new(ErrorKind::InvalidData, "Addons data too large"));
-        }
         _ = client_socket.read_bytes(length as usize).await?;
 
-        // Read network type
+        // read network type
         let network_type = client_socket.read_u8().await?;
 
-        // Read remote port
+        // read remote port
         let remote_port = client_socket.read_u16().await?;
 
-        // Read and validate remote address
-        let remote_addr = read_remote_address(&mut client_socket).await?;
-
-        // Process outbound connection
-        match network_type {
-            protocol::NETWORK_TYPE_TCP => {
-                process_tcp_outbound(&mut client_socket, proxy_ip, &remote_addr, remote_port).await
-            }
-            protocol::NETWORK_TYPE_UDP => {
-                if remote_port != 53 {
-                    return Err(Error::new(
-                        ErrorKind::InvalidData,
-                        "UDP proxy only supports DNS queries (port 53)",
-                    ));
-                }
-                process_udp_outbound(&mut client_socket).await
-            }
-            _ => Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Unsupported network type: {}", network_type),
-            )),
-        }
-    }
-
-    async fn read_remote_address(client_socket: &mut WebSocketStream<'_>) -> Result<String> {
-        match client_socket.read_u8().await? {
+        // read remote address
+        let remote_addr = match client_socket.read_u8().await? {
             protocol::ADDRESS_TYPE_DOMAIN => {
                 let length = client_socket.read_u8().await?;
-                if length as usize > 255 {
-                    return Err(Error::new(ErrorKind::InvalidData, "Domain name too long"));
-                }
                 client_socket.read_string(length as usize).await?
             }
             protocol::ADDRESS_TYPE_IPV4 => {
                 Ipv4Addr::from_bits(client_socket.read_u32().await?).to_string()
             }
-            protocol::ADDRESS_TYPE_IPV6 => {
-                format!("[{}]", Ipv6Addr::from_bits(client_socket.read_u128().await?))
+            protocol::ADDRESS_TYPE_IPV6 => format!(
+                "[{}]",
+                Ipv6Addr::from_bits(client_socket.read_u128().await?)
+            ),
+            _ => {
+                return Err(Error::new(ErrorKind::InvalidData, "invalid address type"));
             }
-            addr_type => Err(Error::new(
+        };
+
+        // process outbound with timeout and state tracking
+        match network_type {
+            protocol::NETWORK_TYPE_TCP => {
+                process_tcp_outbound(&mut client_socket, &remote_addr, remote_port, is_connected).await
+            }
+            protocol::NETWORK_TYPE_UDP => {
+                process_udp_outbound(&mut client_socket, &remote_addr, remote_port, is_connected).await
+            }
+            unknown => Err(Error::new(
                 ErrorKind::InvalidData,
-                format!("Invalid address type: {}", addr_type),
-            ))?,
+                format!("unsupported network type: {}", unknown),
+            )),
         }
     }
 
     async fn process_tcp_outbound(
         client_socket: &mut WebSocketStream<'_>,
-        proxy_ip: Vec<String>,
-        remote_addr: &str,
+        target: &str,
         port: u16,
+        is_connected: Arc<AtomicBool>,
     ) -> Result<()> {
-        let mut last_error = None;
-
-        // Try direct connection first, then proxy IPs
-        for target in std::iter::once(remote_addr.to_string()).chain(proxy_ip) {
-            match timeout(CONNECT_TIMEOUT, connect_tcp(&target, port)).await {
-                Ok(Ok(mut remote_socket)) => {
-                    // Send success response
-                    client_socket.write_all(&protocol::RESPONSE).await?;
-
-                    // Forward data with timeout
-                    match timeout(
-                        crate::TUNNEL_TIMEOUT,
-                        copy_bidirectional(client_socket, &mut remote_socket),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => return Ok(()),
-                        Ok(Err(e)) => {
-                            if e.kind() != ErrorKind::ConnectionReset {
-                                return Err(e);
-                            }
-                        }
-                        Err(_) => {
-                            return Err(Error::new(ErrorKind::TimedOut, "Connection timed out"));
-                        }
-                    }
-                }
-                Ok(Err(e)) => last_error = Some(e),
-                Err(_) => last_error = Some(Error::new(ErrorKind::TimedOut, "Connection timed out")),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            Error::new(ErrorKind::ConnectionRefused, "No available targets to connect")
-        }))
-    }
-
-    async fn connect_tcp(target: &str, port: u16) -> Result<Socket> {
-        let socket = Socket::builder().connect(target, port).map_err(|e| {
+        // connect to remote socket
+        let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionAborted,
-                format!("Failed to connect to {}: {}", target, e),
+                format!("connect to remote failed: {}", e),
             )
         })?;
 
-        socket.opened().await.map_err(|e| {
+        // check remote socket
+        remote_socket.opened().await.map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionReset,
-                format!("Socket not opened for {}: {}", target, e),
+                format!("remote socket not opened: {}", e),
             )
         })?;
 
-        Ok(socket)
+        // send response header
+        client_socket
+            .write(&protocol::RESPONSE)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("send response header failed: {}", e),
+                )
+            })?;
+
+        // Forward data with proper cleanup
+        let result = copy_bidirectional(client_socket, &mut remote_socket).await;
+        
+        // Ensure connection is marked as closed
+        is_connected.store(false, Ordering::SeqCst);
+        
+        result.map_err(|e| {
+            Error::new(
+                ErrorKind::ConnectionAborted,
+                format!("forward data between client and remote failed: {}", e),
+            )
+        })?;
+
+        Ok(())
     }
 
-    async fn process_udp_outbound(client_socket: &mut WebSocketStream<'_>) -> Result<()> {
-        // Send success response
-        client_socket.write_all(&protocol::RESPONSE).await?;
+    async fn process_udp_outbound(
+        client_socket: &mut WebSocketStream<'_>,
+        target: &str,
+        port: u16,
+        is_connected: Arc<AtomicBool>,
+    ) -> Result<()> {
+        // check port (only support dns query)
+        if port != 53 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "not supported udp proxy yet",
+            ));
+        }
 
+        // send response header
+        client_socket
+            .write(&protocol::RESPONSE)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("send response header failed: {}", e),
+                )
+            })?;
+
+        // forward data
         loop {
-            // Read packet length with timeout
-            let length = match timeout(DNS_TIMEOUT, client_socket.read_u16()).await {
-                Ok(Ok(len)) => len,
-                Ok(Err(e)) => {
-                    if e.kind() == ErrorKind::UnexpectedEof {
-                        return Ok(());
-                    }
-                    return Err(e);
-                }
-                Err(_) => return Err(Error::new(ErrorKind::TimedOut, "DNS query timed out")),
-            };
-
-            if length as usize > crate::MAX_BUFFER_SIZE {
-                return Err(Error::new(ErrorKind::InvalidData, "DNS packet too large"));
+            // read packet length
+            let length = client_socket.read_u16().await;
+            if length.is_err() {
+                return Ok(());
             }
 
-            // Read DNS packet
-            let packet = client_socket.read_bytes(length as usize).await?;
+            // read dns packet
+            let packet = client_socket.read_bytes(length.unwrap() as usize).await?;
 
-            // Create and send DNS-over-HTTPS request
-            let response = timeout(
-                DNS_TIMEOUT,
-                send_dns_query(packet, client_socket.ws_version()),
-            )
-            .await
-            .map_err(|_| Error::new(ErrorKind::TimedOut, "DNS-over-HTTPS request timed out"))??;
+            // create request
+            let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
+                // create request
+                let mut init = RequestInit::new();
+                init.method = Method::Post;
+                init.headers = Headers::new();
+                init.body = Some(packet.into());
 
-            // Write response
-            client_socket.write_u16(response.len() as u16).await?;
-            client_socket.write_all(&response).await?;
-        }
-    }
+                // set headers
+                _ = init.headers.set("Content-Type", "application/dns-message");
 
-    async fn send_dns_query(packet: Vec<u8>, ws_version: &str) -> Result<Vec<u8>> {
-        let mut headers = Headers::new();
-        headers.set("Content-Type", "application/dns-message")?;
-        headers.set("User-Agent", &format!("CF-Worker-DNS/{}", ws_version))?;
+                init
+            })
+            .unwrap();
 
-        let mut init = RequestInit::new();
-        init.method = Method::Post;
-        init.headers = headers;
-        init.body = Some(packet.into());
+            // invoke dns-over-http resolver
+            let mut response = Fetch::Request(request).send().await.map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("send DNS-over-HTTP request failed: {}", e),
+                )
+            })?;
 
-        let request = Request::new_with_init(
-            "https://1.1.1.1/dns-query",
-            &init,
-        )?;
+            // read response
+            let data = response.bytes().await.map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("DNS-over-HTTP response body error: {}", e),
+                )
+            })?;
 
-        let response = Fetch::Request(request)
-            .send()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("DNS-over-HTTPS request failed: {}", e)))?;
-
-        response
-            .bytes()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to read DNS response: {}", e)))
+            // write response
+            client_socket.write_u16(data.len() as u16).await?;
+            client_socket.write_all(&data).await?;
+		}
+        
+        // Mark connection as closed when done
+        is_connected.store(false, Ordering::SeqCst);
+        
+        Ok(())
     }
 }
 
@@ -407,7 +358,6 @@ mod websocket {
     use std::{
         io::{Error, ErrorKind, Result},
         pin::Pin,
-        sync::atomic::{AtomicBool, Ordering},
         task::{Context, Poll},
     };
 
@@ -416,13 +366,16 @@ mod websocket {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use worker::{EventStream, WebSocket, WebsocketEvent};
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     #[pin_project]
     pub struct WebSocketStream<'a> {
         ws: &'a WebSocket,
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
-        is_closed: AtomicBool,
+        is_closed: Arc<AtomicBool>,
     }
 
     impl<'a> WebSocketStream<'a> {
@@ -431,16 +384,16 @@ mod websocket {
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
-            let mut buffer = BytesMut::with_capacity(crate::MAX_BUFFER_SIZE);
+            let mut buffer = BytesMut::with_capacity(8192); // Preallocate buffer
             if let Some(data) = early_data {
-                buffer.put_slice(&data);
+                buffer.put_slice(&data)
             }
 
             Self {
                 ws,
                 stream,
                 buffer,
-                is_closed: AtomicBool::new(false),
+                is_closed: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -451,44 +404,40 @@ mod websocket {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
-            let this = self.project();
+            let mut this = self.project();
 
-            if this.is_closed.load(Ordering::Relaxed) {
+            // Check if connection is closed
+            if this.is_closed.load(Ordering::SeqCst) {
                 return Poll::Ready(Ok(()));
             }
 
-            if !this.buffer.is_empty() {
+            loop {
                 let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-                buf.put_slice(&this.buffer.split_to(amt));
-                return Poll::Ready(Ok(()));
-            }
+                if amt > 0 {
+                    buf.put_slice(&this.buffer.split_to(amt));
+                    return Poll::Ready(Ok(()));
+                }
 
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                    if let Some(data) = msg.bytes() {
-                        if data.len() > crate::MAX_BUFFER_SIZE {
-                            return Poll::Ready(Err(Error::new(
-                                ErrorKind::InvalidData,
-                                "Message exceeds maximum buffer size",
-                            )));
-                        }
-                        this.buffer.put_slice(&data);
-                        let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-                        buf.put_slice(&this.buffer.split_to(amt));
+                match this.stream.as_mut().poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
+                        if let Some(data) = msg.bytes() {
+                            this.buffer.put_slice(&data);
+                        };
+                        continue;
                     }
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                    this.is_closed.store(true, Ordering::Relaxed);
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
-                }
-                Poll::Ready(None) => {
-                    this.is_closed.store(true, Ordering::Relaxed);
-                    Poll::Ready(Ok(()))
+                    Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
+                        this.is_closed.store(true, Ordering::SeqCst);
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        this.is_closed.store(true, Ordering::SeqCst);
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+                    }
+                    Poll::Ready(None) => {
+                        this.is_closed.store(true, Ordering::SeqCst);
+                        return Poll::Ready(Ok(()));
+                    }
                 }
             }
         }
@@ -500,45 +449,33 @@ mod websocket {
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<Result<usize>> {
-            if self.is_closed.load(Ordering::Relaxed) {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "WebSocket connection is closed",
-                )));
-            }
-
-            if buf.len() > crate::MAX_BUFFER_SIZE {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Write buffer exceeds maximum size",
-                )));
+            // Check if connection is closed
+            if self.is_closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "connection closed")));
             }
 
             match self.ws.send_with_bytes(buf) {
                 Ok(_) => Poll::Ready(Ok(buf.len())),
                 Err(e) => {
-                    self.is_closed.store(true, Ordering::Relaxed);
+                    self.is_closed.store(true, Ordering::SeqCst);
                     Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
                 }
             }
         }
 
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            if self.is_closed.load(Ordering::Relaxed) {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "WebSocket connection is closed",
-                )));
+            if self.is_closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "connection closed")));
             }
             Poll::Ready(Ok(()))
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            if !self.is_closed.load(Ordering::Relaxed) {
+            if !self.is_closed.load(Ordering::SeqCst) {
                 if let Err(e) = self.ws.close(None, Some("normal close")) {
                     return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
                 }
-                self.is_closed.store(true, Ordering::Relaxed);
+                self.is_closed.store(true, Ordering::SeqCst);
             }
             Poll::Ready(Ok(()))
         }
