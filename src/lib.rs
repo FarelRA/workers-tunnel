@@ -315,6 +315,7 @@ mod websocket {
     use futures_util::StreamExt;
     use tokio::io::{AsyncRead, AsyncWrite};
     use worker::*;
+    use futures_util::Future;
 
     pub struct WebSocketStream<'a> {
         ws: &'a WebSocket,
@@ -345,14 +346,13 @@ mod websocket {
         #[inline]
         fn set_closed(&self, error_code: Option<u16>) {
             self.closed.store(true, Ordering::Relaxed);
-            if let Some(code) = error_code {
-                // Only attempt to close if not already closed
-                let _ = self.ws.close(Some(code), None);
+           if let Some(code) = error_code {
+                let _ = self.ws.close::<&str>(Some(code), None);
             }
         }
 
         async fn process_message(&mut self) -> Result<Option<Bytes>> {
-            if self.is_closed() {
+             if self.is_closed() {
                 return Ok(None);
             }
 
@@ -364,9 +364,8 @@ mod websocket {
                         Ok(None)
                     }
                 }
-                 Some(Ok(WebsocketEvent::Close(e))) => {
-                    // Handle close frame with proper error code
-                    let code = e.and_then(|e| e.code);
+                Some(Ok(WebsocketEvent::Close(e))) => {
+                     let code = e.and_then(|e| e.code);
                     self.set_closed(code);
                     Ok(None)
                 }
@@ -391,7 +390,7 @@ mod websocket {
             use std::task::Poll;
 
             if self.is_closed() {
-                return Poll::Ready(Ok(()));
+                 return Poll::Ready(Ok(()));
             }
 
              // Use buffered data first
@@ -400,24 +399,22 @@ mod websocket {
                 buf.put_slice(&self.buffer.split_to(to_read));
                 return Poll::Ready(Ok(()));
             }
-
+            
              // Then try to get new data
-             match futures_util::ready!(std::pin::Pin::new(&mut futures_util::future::poll_fn(|cx| {
-                Box::pin(self.process_message()).as_mut().poll(cx)
-            }))) {
+            match futures_util::ready!(Box::pin(self.process_message()).as_mut().poll(cx)) {
                 Ok(Some(data)) => {
-                    buf.put_slice(&data);
+                   buf.put_slice(&data);
                     Poll::Ready(Ok(()))
                 }
-                 Ok(None) => {
-                     if !self.is_closed() {
-                       self.set_closed(Some(1000));
+                Ok(None) => {
+                    if !self.is_closed() {
+                        self.set_closed(Some(1000));
                     }
                     Poll::Ready(Ok(()))
                 }
-                Err(e) => {
+                 Err(e) => {
                      self.set_closed(Some(1011));
-                     Poll::Ready(Err(e))
+                    Poll::Ready(Err(e))
                 }
             }
         }
