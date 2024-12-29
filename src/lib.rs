@@ -4,7 +4,7 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
-    // Get user ID
+    // Get user id
     let user_id = env.var("USER_ID")?.to_string();
     let user_id = parse_user_id(&user_id);
 
@@ -16,16 +16,15 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
 
-    // Better disguising
+    // Fallback site for disguising
     let fallback_site = match env.var("FALLBACK_SITE") {
         Ok(f) => f.to_string(),
-        Err(_) => String::new(),
+        Err(_) => String::from(""),
     };
     let should_fallback = match req.headers().get("Upgrade")? {
-        Some(upgrade) => upgrade != *"websocket",
+        Some(up) => up != *"websocket",
         None => true,
     };
-
     if should_fallback && !fallback_site.is_empty() {
         let req = Fetch::Url(Url::parse(&fallback_site)?);
         return req.send().await;
@@ -39,7 +38,6 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let WebSocketPair { client, server } = WebSocketPair::new()?;
     server.accept()?;
 
-    // Spawn a new async task for handling the WebSocket connection
     wasm_bindgen_futures::spawn_local(async move {
         // Create WebSocket stream
         let socket = WebSocketStream::new(
@@ -48,20 +46,14 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
             early_data,
         );
 
-        // Into tunnel
+        // Run tunnel with error handling
         if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
-            // Log error
+            // Log error and close WebSocket
             console_error!("error: {}", err);
-
-            // Close WebSocket connection with error code and reason
             _ = server.close(Some(1003), Some("invalid request"));
-        } else {
-            // Ensure the WebSocket is closed gracefully on success
-            _ = server.close(Some(1000), Some("normal closure"));
         }
     });
 
-    // Return the WebSocket client response
     Response::from_websocket(client)
 }
 
@@ -79,7 +71,6 @@ mod protocol {
 mod proxy {
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
-
     use crate::ext::StreamExt;
     use crate::protocol;
     use crate::websocket::WebSocketStream;
@@ -124,27 +115,27 @@ mod proxy {
         user_id: Vec<u8>,
         proxy_ip: Vec<String>,
     ) -> Result<()> {
-        // read version
+        // Read version
         if client_socket.read_u8().await? != protocol::VERSION {
             return Err(Error::new(ErrorKind::InvalidData, "invalid version"));
         }
 
-        // verify user_id
+        // Verify user_id
         if client_socket.read_bytes(16).await? != user_id {
             return Err(Error::new(ErrorKind::InvalidData, "invalid user id"));
         }
 
-        // ignore addons
+        // Ignore addons
         let length = client_socket.read_u8().await?;
         _ = client_socket.read_bytes(length as usize).await?;
 
-        // read network type
+        // Read network type
         let network_type = client_socket.read_u8().await?;
 
-        // read remote port
+        // Read remote port
         let remote_port = client_socket.read_u16().await?;
 
-        // read remote address
+        // Read remote address
         let remote_addr = match client_socket.read_u8().await? {
             protocol::ADDRESS_TYPE_DOMAIN => {
                 let length = client_socket.read_u8().await?;
@@ -162,24 +153,21 @@ mod proxy {
             }
         };
 
-        // process outbound
+        // Process outbound
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
-                // try to connect to remote
+                // Try to connect to remote
                 for target in [vec![remote_addr], proxy_ip].concat() {
                     match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
                         Ok(_) => {
-                            // normal closed
+                            // Successfully closed
                             return Ok(());
                         }
                         Err(e) => {
-                            // connection reset
+                            // Connection reset or timeout, continue to next target
                             if e.kind() != ErrorKind::ConnectionReset {
                                 return Err(e);
                             }
-
-                            // continue to next target
-                            continue;
                         }
                     }
                 }
@@ -196,12 +184,13 @@ mod proxy {
         }
     }
 
+    // Process TCP outbound connections
     async fn process_tcp_outbound(
         client_socket: &mut WebSocketStream<'_>,
         target: &str,
         port: u16,
     ) -> Result<()> {
-        // connect to remote socket
+        // Try connecting to remote target
         let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionAborted,
@@ -209,7 +198,7 @@ mod proxy {
             )
         })?;
 
-        // check remote socket
+        // Open remote socket
         remote_socket.opened().await.map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionReset,
@@ -217,7 +206,7 @@ mod proxy {
             )
         })?;
 
-        // send response header
+        // Send response header to client
         client_socket
             .write(&protocol::RESPONSE)
             .await
@@ -228,7 +217,7 @@ mod proxy {
                 )
             })?;
 
-        // forward data
+        // Forward data between client and remote
         copy_bidirectional(client_socket, &mut remote_socket)
             .await
             .map_err(|e| {
@@ -241,12 +230,13 @@ mod proxy {
         Ok(())
     }
 
+    // Process UDP outbound connections (e.g., DNS queries)
     async fn process_udp_outbound(
         client_socket: &mut WebSocketStream<'_>,
         _: &str,
         port: u16,
     ) -> Result<()> {
-        // check port (only support dns query)
+        // Only support DNS queries (port 53)
         if port != 53 {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -254,7 +244,7 @@ mod proxy {
             ));
         }
 
-        // send response header
+        // Send response header to client
         client_socket
             .write(&protocol::RESPONSE)
             .await
@@ -265,41 +255,35 @@ mod proxy {
                 )
             })?;
 
-        // forward data
+        // Forward DNS query packets
         loop {
-            // read packet length
             let length = client_socket.read_u16().await;
             if length.is_err() {
                 return Ok(());
             }
 
-            // read dns packet
             let packet = client_socket.read_bytes(length.unwrap() as usize).await?;
 
-            // create request
             let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
-                // create request
                 let mut init = RequestInit::new();
                 init.method = Method::Post;
                 init.headers = Headers::new();
                 init.body = Some(packet.into());
-
-                // set headers
                 _ = init.headers.set("Content-Type", "application/dns-message");
-
                 init
             })
             .unwrap();
 
-            // invoke dns-over-http resolver
-            let mut response = Fetch::Request(request).send().await.map_err(|e| {
-                Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("send DNS-over-HTTP request failed: {}", e),
-                )
-            })?;
+            let mut response = Fetch::Request(request)
+                .send()
+                .await
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::ConnectionAborted,
+                        format!("send DNS-over-HTTP request failed: {}", e),
+                    )
+                })?;
 
-            // read response
             let data = response.bytes().await.map_err(|e| {
                 Error::new(
                     ErrorKind::ConnectionAborted,
@@ -307,43 +291,13 @@ mod proxy {
                 )
             })?;
 
-            // write response
             client_socket.write_u16(data.len() as u16).await?;
             client_socket.write_all(&data).await?;
         }
     }
 }
 
-mod ext {
-    use std::io::Result;
-    use tokio::io::AsyncReadExt;
-    #[allow(dead_code)]
-    pub trait StreamExt {
-        async fn read_string(&mut self, n: usize) -> Result<String>;
-        async fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>>;
-    }
-
-    impl<T: AsyncReadExt + Unpin + ?Sized> StreamExt for T {
-        async fn read_string(&mut self, n: usize) -> Result<String> {
-            self.read_bytes(n).await.map(|bytes| {
-                String::from_utf8(bytes).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid string: {}", e),
-                    )
-                })
-            })?
-        }
-
-        async fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
-            let mut buffer = vec![0u8; n];
-            self.read_exact(&mut buffer).await?;
-
-            Ok(buffer)
-        }
-    }
-}
-
+// WebSocket extension functions
 mod websocket {
     use futures_util::Stream;
     use std::{
