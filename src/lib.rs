@@ -463,7 +463,7 @@ mod websocket {
             Poll::Ready(Ok(()))
         }
 
-         fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
            if !self.is_closed {
                 if let Err(e) = self.ws.close(None, Some("normal close")) {
                      // we don't really care if we failed to close it, because it means it was already closed.
