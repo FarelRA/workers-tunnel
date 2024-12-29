@@ -211,7 +211,7 @@ mod proxy {
         port: u16,
     ) -> Result<()> {
         // connect to remote socket
-        let mut remote_socket = match Socket::builder().connect(target, port).await{
+        let mut remote_socket = match Socket::builder().connect(target, port){
             Ok(socket) => socket,
             Err(e) =>  {
                   return Err(Error::new(
