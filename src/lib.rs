@@ -4,6 +4,7 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
+     use worker::console_error; // Add this line here
     // get user id
     let user_id = env.var("USER_ID")?.to_string();
     let user_id = parse_user_id(&user_id);
@@ -377,7 +378,7 @@ mod websocket {
     use bytes::{BufMut, BytesMut};
     use pin_project::pin_project;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-    use worker::{EventStream, WebSocket, WebsocketEvent};
+    use worker::{EventStream, WebSocket, WebsocketEvent, console_error}; // Add console_error here
 
     #[pin_project]
     pub struct WebSocketStream<'a> {
