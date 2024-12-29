@@ -1,7 +1,6 @@
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel};
 use crate::websocket::WebSocketStream;
 use worker::*;
-//use tokio::time::{timeout, Duration}; // Removed unused imports
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
@@ -340,7 +339,7 @@ mod proxy {
           };
            
          
-          let data = match timeout(Duration::from_secs(5), response.bytes()).await { // Changed here to mut
+          let data = match timeout(Duration::from_secs(5), response.bytes().await).await {
              Ok(data) => {
                 match data {
                     Ok(data) => data,
