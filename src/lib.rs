@@ -322,7 +322,7 @@ mod proxy {
              
            let response_result = timeout(Duration::from_secs(5),  Fetch::Request(request).send()).await;
 
-          let response = match response_result{
+          let mut response = match response_result{
               Ok(response) => {
                  match response {
                     Ok(response) => response,
