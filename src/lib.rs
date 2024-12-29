@@ -4,17 +4,6 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
-    // Add timeout to prevent infinite hanging
-    let timeout = std::time::Duration::from_secs(50); // Cloudflare's limit is 60s
-    let response = tokio::time::timeout(timeout, handle_request(req, env)).await;
-
-    match response {
-        Ok(result) => result,
-        Err(_) => Response::error("Worker timed out", 504),
-    }
-}
-
-async fn handle_request(req: Request, env: Env) -> Result<Response> {
     // get user id
     let user_id = env.var("USER_ID")?.to_string();
     let user_id = parse_user_id(&user_id);
@@ -32,14 +21,11 @@ async fn handle_request(req: Request, env: Env) -> Result<Response> {
         Ok(f) => f.to_string(),
         Err(_) => String::from(""),
     };
-    
-    // Check for websocket upgrade
-    let is_websocket = match req.headers().get("Upgrade")? {
-        Some(up) => up.eq_ignore_ascii_case("websocket"),
-        None => false,
+    let should_fallback = match req.headers().get("Upgrade")? {
+        Some(up) => up != *"websocket",
+        None => true,
     };
-
-    if !is_websocket && !fallback_site.is_empty() {
+    if should_fallback && !fallback_site.is_empty() {
         let req = Fetch::Url(Url::parse(&fallback_site)?);
         return req.send().await;
     }
@@ -48,58 +34,45 @@ async fn handle_request(req: Request, env: Env) -> Result<Response> {
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
-    // Accept websocket connection with proper error handling
-    let pair = WebSocketPair::new().map_err(|e| {
-        console_error!("Failed to create WebSocket pair: {}", e);
-        Error::from(e)
-    })?;
-    
-    let WebSocketPair { client, server } = pair;
-    
-    server.accept().map_err(|e| {
-        console_error!("Failed to accept WebSocket connection: {}", e);
-        Error::from(e)
-    })?;
+    // Accept / handle a websocket connection
+    let WebSocketPair { client, server } = WebSocketPair::new()?;
+    server.accept()?;
 
-    // Use a separate task for connection handling
-    let handle = wasm_bindgen_futures::spawn_local(async move {
-        let result = handle_connection(&server, early_data, user_id, proxy_ip).await;
-        if let Err(err) = result {
-            console_error!("Connection error: {}", err);
-            // Ensure connection is properly closed on error
-            let _ = server.close(Some(1011), Some(&format!("Error: {}", err)));
+    wasm_bindgen_futures::spawn_local({
+        let proxy_ip = proxy_ip.clone();
+        let user_id = user_id.clone();
+        async move {
+            // create websocket stream
+            let socket = WebSocketStream::new(
+                &server,
+                server.events().expect("could not open stream"),
+                early_data,
+            );
+
+            // into tunnel
+            let result = run_tunnel(socket, user_id, proxy_ip).await;
+            
+            // log error
+             if let Err(err) = &result {
+                console_error!("error: {}", err);
+            }
+
+            // close websocket connection on tunnel exit
+            let close_code = match result {
+                Ok(_) => Some(1000), // Normal Closure
+                Err(_) => Some(1003), // Invalid request or other error
+            };
+            
+             let close_reason = match result {
+                Ok(_) => Some("normal close"),
+                Err(_) => Some("invalid request"),
+            };
+            _ = server.close(close_code, close_reason);
+          
         }
     });
 
-    // Return client socket immediately
     Response::from_websocket(client)
-}
-
-async fn handle_connection(
-    server: &WebSocket,
-    early_data: Option<Vec<u8>>,
-    user_id: Vec<u8>,
-    proxy_ip: Vec<String>,
-) -> Result<()> {
-    // Create websocket stream with proper error handling
-    let socket = match server.events() {
-        Ok(events) => WebSocketStream::new(server, events, early_data),
-        Err(e) => {
-            console_error!("Failed to get WebSocket events: {}", e);
-            return Err(Error::from(e));
-        }
-    };
-
-    // Run tunnel with proper cleanup
-    let result = run_tunnel(socket, user_id, proxy_ip).await;
-    
-    // Ensure proper cleanup on error
-    if let Err(ref e) = result {
-        console_error!("Tunnel error: {}", e);
-        let _ = server.close(Some(1011), Some(&format!("Tunnel error: {}", e)));
-    }
-    
-    result
 }
 
 #[allow(dead_code)]
@@ -116,8 +89,6 @@ mod protocol {
 mod proxy {
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     use crate::ext::StreamExt;
     use crate::protocol;
@@ -163,15 +134,6 @@ mod proxy {
         user_id: Vec<u8>,
         proxy_ip: Vec<String>,
     ) -> Result<()> {
-        // Add connection state tracking
-        let is_connected = Arc::new(AtomicBool::new(true));
-        let is_connected_clone = is_connected.clone();
-
-        // Cleanup handler
-        let _cleanup = defer::defer(move || {
-            is_connected_clone.store(false, Ordering::SeqCst);
-        });
-
         // read version
         if client_socket.read_u8().await? != protocol::VERSION {
             return Err(Error::new(ErrorKind::InvalidData, "invalid version"));
@@ -210,13 +172,31 @@ mod proxy {
             }
         };
 
-        // process outbound with timeout and state tracking
+        // process outbound
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
-                process_tcp_outbound(&mut client_socket, &remote_addr, remote_port, is_connected).await
+                // try to connect to remote
+                for target in [vec![remote_addr], proxy_ip].concat() {
+                    match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
+                        Ok(_) => {
+                            // normal closed
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // connection reset
+                             if e.kind() != ErrorKind::ConnectionReset {
+                                return Err(e);
+                            }
+                            // continue to next target
+                            continue;
+                        }
+                    }
+                }
+
+                 Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
             }
             protocol::NETWORK_TYPE_UDP => {
-                process_udp_outbound(&mut client_socket, &remote_addr, remote_port, is_connected).await
+                process_udp_outbound(&mut client_socket, &remote_addr, remote_port).await
             }
             unknown => Err(Error::new(
                 ErrorKind::InvalidData,
@@ -229,7 +209,6 @@ mod proxy {
         client_socket: &mut WebSocketStream<'_>,
         target: &str,
         port: u16,
-        is_connected: Arc<AtomicBool>,
     ) -> Result<()> {
         // connect to remote socket
         let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
@@ -239,7 +218,7 @@ mod proxy {
             )
         })?;
 
-        // check remote socket
+         // check remote socket
         remote_socket.opened().await.map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionReset,
@@ -247,46 +226,6 @@ mod proxy {
             )
         })?;
 
-        // send response header
-        client_socket
-            .write(&protocol::RESPONSE)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("send response header failed: {}", e),
-                )
-            })?;
-
-        // Forward data with proper cleanup
-        let result = copy_bidirectional(client_socket, &mut remote_socket).await;
-        
-        // Ensure connection is marked as closed
-        is_connected.store(false, Ordering::SeqCst);
-        
-        result.map_err(|e| {
-            Error::new(
-                ErrorKind::ConnectionAborted,
-                format!("forward data between client and remote failed: {}", e),
-            )
-        })?;
-
-        Ok(())
-    }
-
-    async fn process_udp_outbound(
-        client_socket: &mut WebSocketStream<'_>,
-        target: &str,
-        port: u16,
-        is_connected: Arc<AtomicBool>,
-    ) -> Result<()> {
-        // check port (only support dns query)
-        if port != 53 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "not supported udp proxy yet",
-            ));
-        }
 
         // send response header
         client_socket
@@ -300,18 +239,56 @@ mod proxy {
             })?;
 
         // forward data
+        copy_bidirectional(client_socket, &mut remote_socket)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("forward data between client and remote failed: {}", e),
+                )
+            })?;
+
+        Ok(())
+    }
+
+    async fn process_udp_outbound(
+        client_socket: &mut WebSocketStream<'_>,
+        _: &str,
+        port: u16,
+    ) -> Result<()> {
+        // check port (only support dns query)
+        if port != 53 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "not supported udp proxy yet",
+            ));
+        }
+
+        // send response header
+        client_socket
+            .write(&protocol::RESPONSE)
+            .await
+             .map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("send response header failed: {}", e),
+                )
+            })?;
+
+
+        // forward data
         loop {
             // read packet length
             let length = client_socket.read_u16().await;
             if length.is_err() {
-                return Ok(());
+               return Ok(());
             }
 
             // read dns packet
             let packet = client_socket.read_bytes(length.unwrap() as usize).await?;
 
             // create request
-            let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
+             let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
                 // create request
                 let mut init = RequestInit::new();
                 init.method = Method::Post;
@@ -326,9 +303,9 @@ mod proxy {
             .unwrap();
 
             // invoke dns-over-http resolver
-            let mut response = Fetch::Request(request).send().await.map_err(|e| {
+             let mut response = Fetch::Request(request).send().await.map_err(|e| {
                 Error::new(
-                    ErrorKind::ConnectionAborted,
+                     ErrorKind::ConnectionAborted,
                     format!("send DNS-over-HTTP request failed: {}", e),
                 )
             })?;
@@ -337,19 +314,44 @@ mod proxy {
             let data = response.bytes().await.map_err(|e| {
                 Error::new(
                     ErrorKind::ConnectionAborted,
-                    format!("DNS-over-HTTP response body error: {}", e),
+                     format!("DNS-over-HTTP response body error: {}", e),
                 )
             })?;
-
+            
             // write response
             client_socket.write_u16(data.len() as u16).await?;
             client_socket.write_all(&data).await?;
-		}
-        
-        // Mark connection as closed when done
-        is_connected.store(false, Ordering::SeqCst);
-        
-        Ok(())
+        }
+    }
+}
+
+mod ext {
+    use std::io::Result;
+    use tokio::io::AsyncReadExt;
+    #[allow(dead_code)]
+    pub trait StreamExt {
+        async fn read_string(&mut self, n: usize) -> Result<String>;
+        async fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>>;
+    }
+
+    impl<T: AsyncReadExt + Unpin + ?Sized> StreamExt for T {
+        async fn read_string(&mut self, n: usize) -> Result<String> {
+            self.read_bytes(n).await.map(|bytes| {
+                String::from_utf8(bytes).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid string: {}", e),
+                    )
+                })
+            })?
+        }
+
+        async fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
+            let mut buffer = vec![0u8; n];
+            self.read_exact(&mut buffer).await?;
+
+            Ok(buffer)
+        }
     }
 }
 
@@ -366,16 +368,12 @@ mod websocket {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use worker::{EventStream, WebSocket, WebsocketEvent};
 
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
     #[pin_project]
     pub struct WebSocketStream<'a> {
         ws: &'a WebSocket,
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
-        is_closed: Arc<AtomicBool>,
     }
 
     impl<'a> WebSocketStream<'a> {
@@ -384,17 +382,12 @@ mod websocket {
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
-            let mut buffer = BytesMut::with_capacity(8192); // Preallocate buffer
+            let mut buffer = BytesMut::new();
             if let Some(data) = early_data {
                 buffer.put_slice(&data)
             }
 
-            Self {
-                ws,
-                stream,
-                buffer,
-                is_closed: Arc::new(AtomicBool::new(false)),
-            }
+            Self { ws, stream, buffer }
         }
     }
 
@@ -406,11 +399,6 @@ mod websocket {
         ) -> Poll<Result<()>> {
             let mut this = self.project();
 
-            // Check if connection is closed
-            if this.is_closed.load(Ordering::SeqCst) {
-                return Poll::Ready(Ok(()));
-            }
-
             loop {
                 let amt = std::cmp::min(this.buffer.len(), buf.remaining());
                 if amt > 0 {
@@ -420,24 +408,21 @@ mod websocket {
 
                 match this.stream.as_mut().poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
+                   Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
                         if let Some(data) = msg.bytes() {
                             this.buffer.put_slice(&data);
                         };
                         continue;
                     }
-                    Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                        this.is_closed.store(true, Ordering::SeqCst);
-                        return Poll::Ready(Ok(()));
-                    }
                     Poll::Ready(Some(Err(e))) => {
-                        this.is_closed.store(true, Ordering::SeqCst);
-                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
                     }
-                    Poll::Ready(None) => {
-                        this.is_closed.store(true, Ordering::SeqCst);
-                        return Poll::Ready(Ok(()));
-                    }
+                     Poll::Ready(None) => {
+                        return Poll::Ready(Ok(()))
+                     } // None or Close event, return Ok to indicate stream end
+                     Poll::Ready(Some(Ok(WebsocketEvent::Close(_))))=>{
+                       return  Poll::Ready(Ok(()));
+                     }
                 }
             }
         }
@@ -449,33 +434,20 @@ mod websocket {
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<Result<usize>> {
-            // Check if connection is closed
-            if self.is_closed.load(Ordering::SeqCst) {
-                return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "connection closed")));
+            if let Err(e) = self.ws.send_with_bytes(buf) {
+                return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
             }
 
-            match self.ws.send_with_bytes(buf) {
-                Ok(_) => Poll::Ready(Ok(buf.len())),
-                Err(e) => {
-                    self.is_closed.store(true, Ordering::SeqCst);
-                    Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
-                }
-            }
+            Poll::Ready(Ok(buf.len()))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            if self.is_closed.load(Ordering::SeqCst) {
-                return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "connection closed")));
-            }
             Poll::Ready(Ok(()))
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            if !self.is_closed.load(Ordering::SeqCst) {
-                if let Err(e) = self.ws.close(None, Some("normal close")) {
-                    return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
-                }
-                self.is_closed.store(true, Ordering::SeqCst);
+             if let Err(e) = self.ws.close(None, Some("normal close")) {
+                return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
             }
             Poll::Ready(Ok(()))
         }
