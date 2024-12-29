@@ -182,9 +182,9 @@ mod proxy {
                             // normal closed
                             return Ok(());
                         }
-                        Err(e) => {
+                         Err(e) => {
                             // connection reset
-                             if e.kind() != ErrorKind::ConnectionReset {
+                            if e.kind() != ErrorKind::ConnectionReset {
                                 return Err(e);
                             }
                             // continue to next target
@@ -239,15 +239,17 @@ mod proxy {
             })?;
 
         // forward data
-        copy_bidirectional(client_socket, &mut remote_socket)
-            .await
-            .map_err(|e| {
-                Error::new(
+         let copy_result = copy_bidirectional(client_socket, &mut remote_socket).await;
+        
+        if let Err(e) = copy_result {
+            if e.kind() != ErrorKind::BrokenPipe &&  e.kind() != ErrorKind::ConnectionAborted{
+                 return  Err(Error::new(
                     ErrorKind::ConnectionAborted,
                     format!("forward data between client and remote failed: {}", e),
-                )
-            })?;
-
+                ));
+            }
+        }
+       
         Ok(())
     }
 
@@ -283,9 +285,12 @@ mod proxy {
             if length.is_err() {
                return Ok(());
             }
-
-            // read dns packet
-            let packet = client_socket.read_bytes(length.unwrap() as usize).await?;
+            let length = length.unwrap();
+            if length == 0 {
+                return Ok(());
+            }
+             // read dns packet
+            let packet = client_socket.read_bytes(length as usize).await?;
 
             // create request
              let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
