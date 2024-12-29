@@ -3,12 +3,12 @@ use crate::websocket::WebSocketStream;
 use worker::*;
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    // get user id
+async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
+    // Get user ID
     let user_id = env.var("USER_ID")?.to_string();
     let user_id = parse_user_id(&user_id);
 
-    // get proxy ip list
+    // Get proxy IP list
     let proxy_ip = env.var("PROXY_IP")?.to_string();
     let proxy_ip = proxy_ip
         .split_ascii_whitespace()
@@ -16,60 +16,52 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
 
-    // better disguising
+    // Better disguising
     let fallback_site = match env.var("FALLBACK_SITE") {
         Ok(f) => f.to_string(),
-        Err(_) => String::from(""),
+        Err(_) => String::new(),
     };
     let should_fallback = match req.headers().get("Upgrade")? {
-        Some(up) => up != *"websocket",
+        Some(upgrade) => upgrade != *"websocket",
         None => true,
     };
+
     if should_fallback && !fallback_site.is_empty() {
         let req = Fetch::Url(Url::parse(&fallback_site)?);
         return req.send().await;
     }
 
-    // ready early data
+    // Ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
-    // Accept / handle a websocket connection
+    // Accept / handle a WebSocket connection
     let WebSocketPair { client, server } = WebSocketPair::new()?;
+    server.accept()?;
 
-    // Spawn a new task to handle the websocket connection
+    // Spawn a new async task for handling the WebSocket connection
     wasm_bindgen_futures::spawn_local(async move {
-        // Use a Result to handle errors in the spawned task
-        let result = async {
-            server.accept()?;
-            // create websocket stream
-            let socket = WebSocketStream::new(
-                &server,
-                server.events().expect("could not open stream"),
-                early_data,
-            );
+        // Create WebSocket stream
+        let socket = WebSocketStream::new(
+            &server,
+            server.events().expect("could not open stream"),
+            early_data,
+        );
 
-            // into tunnel
-            run_tunnel(socket, user_id, proxy_ip).await
-           
-        }.await;
-
-        if let Err(err) = result {
-            // log error
+        // Into tunnel
+        if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
+            // Log error
             console_error!("error: {}", err);
 
-            // close websocket connection with error code if tunnel fails
+            // Close WebSocket connection with error code and reason
             _ = server.close(Some(1003), Some("invalid request"));
-            
         } else {
-            // Close the socket normally if tunnel is successful
-            _ = server.close(Some(1000), Some("normal close"));
+            // Ensure the WebSocket is closed gracefully on success
+            _ = server.close(Some(1000), Some("normal closure"));
         }
-
-
     });
 
-
+    // Return the WebSocket client response
     Response::from_websocket(client)
 }
 
@@ -371,7 +363,6 @@ mod websocket {
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
-         is_closed: bool
     }
 
     impl<'a> WebSocketStream<'a> {
@@ -385,7 +376,7 @@ mod websocket {
                 buffer.put_slice(&data)
             }
 
-            Self { ws, stream, buffer, is_closed:false }
+            Self { ws, stream, buffer }
         }
     }
 
@@ -396,9 +387,6 @@ mod websocket {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
             let mut this = self.project();
-           if *this.is_closed {
-                return Poll::Ready(Ok(()));
-            }
 
             loop {
                 let amt = std::cmp::min(this.buffer.len(), buf.remaining());
@@ -406,7 +394,6 @@ mod websocket {
                     buf.put_slice(&this.buffer.split_to(amt));
                     return Poll::Ready(Ok(()));
                 }
-
 
                 match this.stream.as_mut().poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
@@ -416,17 +403,10 @@ mod websocket {
                         };
                         continue;
                     }
-                     Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                        *this.is_closed = true;
-                         return Poll::Ready(Ok(()));
-                    }
                     Poll::Ready(Some(Err(e))) => {
-                        *this.is_closed = true;
                         return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
                     }
-                    _ => {
-                         *this.is_closed = true;
-                        return Poll::Ready(Ok(()));}, // None or Close event, return Ok to indicate stream end
+                    _ => return Poll::Ready(Ok(())), // None or Close event, return Ok to indicate stream end
                 }
             }
         }
@@ -449,15 +429,9 @@ mod websocket {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-              // Ensure the WebSocket is only closed once
-             if !self.is_closed {
-                 
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
             if let Err(e) = self.ws.close(None, Some("normal close")) {
                 return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
-            }
-            *self.is_closed = true;
-            
             }
 
             Poll::Ready(Ok(()))
