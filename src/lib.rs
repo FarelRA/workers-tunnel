@@ -40,7 +40,6 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
     let user_id_clone = user_id.clone();
     let proxy_ip_clone = proxy_ip.clone();
-
     wasm_bindgen_futures::spawn_local(async move {
         // create websocket stream
         let socket = WebSocketStream::new(
@@ -57,7 +56,6 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
        if let Err(err) = &tunnel_result {
             console_error!("error: {}", err);
         }
-
 
         let close_code = match tunnel_result {
             Ok(_) => Some(1000), // Normal Closure
@@ -132,7 +130,7 @@ mod proxy {
         bytes
     }
 
-    pub async fn run_tunnel(
+   pub async fn run_tunnel(
         mut client_socket: WebSocketStream<'_>,
         user_id: Vec<u8>,
         proxy_ip: Vec<String>,
@@ -178,14 +176,13 @@ mod proxy {
         // process outbound
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
-                // try to connect to remote
                  for target in [vec![remote_addr], proxy_ip].concat() {
                     match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
                         Ok(_) => {
                             // normal closed
                             return Ok(());
                         }
-                         Err(e) => {
+                        Err(e) => {
                             // connection reset
                             if e.kind() != ErrorKind::ConnectionReset {
                                 return Err(e);
@@ -196,7 +193,7 @@ mod proxy {
                     }
                 }
 
-                 Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
+                Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
             }
             protocol::NETWORK_TYPE_UDP => {
                 process_udp_outbound(&mut client_socket, &remote_addr, remote_port).await
@@ -388,6 +385,7 @@ mod websocket {
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
+        is_closed: bool
     }
 
     impl<'a> WebSocketStream<'a> {
@@ -401,7 +399,7 @@ mod websocket {
                 buffer.put_slice(&data)
             }
 
-            Self { ws, stream, buffer }
+            Self { ws, stream, buffer, is_closed: false }
         }
     }
 
@@ -412,8 +410,10 @@ mod websocket {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
             let mut this = self.project();
-
-            loop {
+            if *this.is_closed{
+                return Poll::Ready(Ok(()));
+            }
+             loop {
                 let amt = std::cmp::min(this.buffer.len(), buf.remaining());
                 if amt > 0 {
                     buf.put_slice(&this.buffer.split_to(amt));
@@ -429,12 +429,15 @@ mod websocket {
                         continue;
                     }
                     Poll::Ready(Some(Err(e))) => {
+                        *this.is_closed = true;
                         return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
                     }
                      Poll::Ready(None) => {
+                         *this.is_closed = true;
                         return Poll::Ready(Ok(()))
                      } // None or Close event, return Ok to indicate stream end
                      Poll::Ready(Some(Ok(WebsocketEvent::Close(_))))=>{
+                         *this.is_closed = true;
                        return  Poll::Ready(Ok(()));
                      }
                 }
@@ -459,9 +462,12 @@ mod websocket {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-             if let Err(e) = self.ws.close(None, Some("normal close")) {
-                return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+         fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+           if !self.is_closed {
+                if let Err(e) = self.ws.close(None, Some("normal close")) {
+                     // we don't really care if we failed to close it, because it means it was already closed.
+                     console_error!("failed to close websocket in shutdown {}", e);
+                 }
             }
             Poll::Ready(Ok(()))
         }
