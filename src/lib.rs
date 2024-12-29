@@ -38,38 +38,41 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let WebSocketPair { client, server } = WebSocketPair::new()?;
     server.accept()?;
 
-    wasm_bindgen_futures::spawn_local({
-        let proxy_ip = proxy_ip.clone();
-        let user_id = user_id.clone();
-        async move {
-            // create websocket stream
-            let socket = WebSocketStream::new(
-                &server,
-                server.events().expect("could not open stream"),
-                early_data,
-            );
+    let user_id_clone = user_id.clone();
+    let proxy_ip_clone = proxy_ip.clone();
 
-            // into tunnel
-            let result = run_tunnel(socket, user_id, proxy_ip).await;
-            
-            // log error
-             if let Err(err) = &result {
-                console_error!("error: {}", err);
-            }
+    wasm_bindgen_futures::spawn_local(async move {
+        // create websocket stream
+        let socket = WebSocketStream::new(
+            &server,
+            server.events().expect("could not open stream"),
+            early_data,
+        );
 
-            // close websocket connection on tunnel exit
-            let close_code = match result {
-                Ok(_) => Some(1000), // Normal Closure
-                Err(_) => Some(1003), // Invalid request or other error
-            };
-            
-             let close_reason = match result {
-                Ok(_) => Some("normal close"),
-                Err(_) => Some("invalid request"),
-            };
-            _ = server.close(close_code, close_reason);
-          
+
+        // create a Result to track if the tunnel process completed or not, for closing correctly
+       let tunnel_result =  run_tunnel(socket, user_id_clone, proxy_ip_clone).await;
+       
+        // log the result
+       if let Err(err) = &tunnel_result {
+            console_error!("error: {}", err);
         }
+
+
+        let close_code = match tunnel_result {
+            Ok(_) => Some(1000), // Normal Closure
+            Err(_) => Some(1003), // Invalid request or other error
+        };
+        
+         let close_reason = match tunnel_result {
+            Ok(_) => Some("normal close"),
+            Err(_) => Some("invalid request"),
+        };
+
+         // close the socket
+         if let Err(err) = server.close(close_code, close_reason) {
+               console_error!("error closing websocket: {}", err);
+         }
     });
 
     Response::from_websocket(client)
@@ -96,8 +99,6 @@ mod proxy {
     use base64::{decode_config, URL_SAFE_NO_PAD};
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
     use worker::*;
-    use tokio::time::{timeout, Duration};
-
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
@@ -178,7 +179,7 @@ mod proxy {
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
                 // try to connect to remote
-                for target in [vec![remote_addr], proxy_ip].concat() {
+                 for target in [vec![remote_addr], proxy_ip].concat() {
                     match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
                         Ok(_) => {
                             // normal closed
@@ -207,13 +208,13 @@ mod proxy {
         }
     }
 
-    async fn process_tcp_outbound(
+     async fn process_tcp_outbound(
         client_socket: &mut WebSocketStream<'_>,
         target: &str,
         port: u16,
     ) -> Result<()> {
         // connect to remote socket
-         let mut remote_socket = match Socket::builder().connect(target, port){
+        let mut remote_socket = match Socket::builder().connect(target, port){
             Ok(socket) => socket,
             Err(e) =>  {
                   return Err(Error::new(
@@ -241,25 +242,13 @@ mod proxy {
             }
 
         // forward data
-        let copy_result = timeout(Duration::from_secs(10), copy_bidirectional(client_socket, &mut remote_socket)).await;
-
-         _ = remote_socket.shutdown().await;
-
-           match copy_result {
-            Ok(copy_res) => {
-                if let Err(e) = copy_res {
-                    if e.kind() != ErrorKind::BrokenPipe && e.kind() != ErrorKind::ConnectionAborted {
-                        return Err(Error::new(
-                            ErrorKind::ConnectionAborted,
-                            format!("forward data between client and remote failed: {}", e),
-                        ));
-                    }
-                }
-            }
-            Err(_) => {
-                return Err(Error::new(
-                    ErrorKind::TimedOut,
-                    "copy_bidirectional timed out",
+        let copy_result = copy_bidirectional(client_socket, &mut remote_socket).await;
+          _ = remote_socket.shutdown().await;
+          if let Err(e) = copy_result {
+            if e.kind() != ErrorKind::BrokenPipe &&  e.kind() != ErrorKind::ConnectionAborted {
+                 return  Err(Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("forward data between client and remote failed: {}", e),
                 ));
             }
         }
@@ -267,7 +256,7 @@ mod proxy {
         Ok(())
     }
 
-    async fn process_udp_outbound(
+     async fn process_udp_outbound(
         client_socket: &mut WebSocketStream<'_>,
         _: &str,
         port: u16,
@@ -281,15 +270,14 @@ mod proxy {
         }
 
         // send response header
-       if let Err(e) = client_socket.write(&protocol::RESPONSE).await {
-            return Err(Error::new(
-                ErrorKind::ConnectionAborted,
-                format!("send response header failed: {}", e),
-            ));
-        }
-
+        if let Err(e) = client_socket.write(&protocol::RESPONSE).await {
+                return Err(Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("send response header failed: {}", e),
+                ));
+         }
         // forward data
-        loop {
+       loop {
             // read packet length
             let length = client_socket.read_u16().await;
              if let Err(_) = length {
@@ -297,14 +285,13 @@ mod proxy {
              }
             let length = length.unwrap();
             if length == 0 {
-                 return Ok(());
-             }
+              return Ok(());
+            }
              // read dns packet
-             let packet = match client_socket.read_bytes(length as usize).await{
+            let packet = match client_socket.read_bytes(length as usize).await{
               Ok(packet) => packet,
               Err(_) => return Ok(())
-             };
-            
+            };
             // create request
              let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
                 // create request
@@ -319,51 +306,36 @@ mod proxy {
                 init
             })
             .unwrap();
-             
-           let response_result = timeout(Duration::from_secs(5),  Fetch::Request(request).send()).await;
+            
+             // invoke dns-over-http resolver
+              let mut response = match Fetch::Request(request).send().await {
+                  Ok(response) => response,
+                   Err(e) => {
+                      console_error!("send DNS-over-HTTP request failed: {}", e);
+                       continue
+                  }
+              };
+              
 
-          let mut response = match response_result{
-              Ok(response) => {
-                 match response {
-                    Ok(response) => response,
-                    Err(e) =>{
-                        console_error!("send DNS-over-HTTP request failed: {}", e);
-                         return Ok(());
-                    }
-                 }
-              }
+            // read response
+            let data = match response.bytes().await {
+              Ok(data) => data,
               Err(e) => {
-                    console_error!("send DNS-over-HTTP request timed out: {}", e);
-                    return Ok(());
+                   console_error!("DNS-over-HTTP response body error: {}", e);
+                 continue;
               }
-          };
-           
-         
-          let data = match timeout(Duration::from_secs(5), response.bytes()).await {
-             Ok(data) => {
-                match data {
-                    Ok(data) => data,
-                    Err(e) =>{
-                        console_error!("DNS-over-HTTP response body error: {}", e);
-                        return Ok(());
-                    }
-                }
-             },
-             Err(e) => {
-                   console_error!("DNS-over-HTTP response body timed out: {}", e);
-                   return Ok(());
-              }
-          };
-             // write response
-            if let Err(e) = client_socket.write_u16(data.len() as u16).await{
-                console_error!("write udp length failed: {}", e);
-                 return Ok(());
+            };
+
+            // write response
+             if let Err(e) = client_socket.write_u16(data.len() as u16).await{
+                 console_error!("write udp length failed: {}", e);
+                continue;
              }
               if let Err(e) = client_socket.write_all(&data).await {
                    console_error!("write udp data failed: {}", e);
-                   return Ok(());
-             }
-         }
+                 continue;
+              }
+        }
     }
 }
 
