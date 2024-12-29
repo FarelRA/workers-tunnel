@@ -1,6 +1,7 @@
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel};
 use crate::websocket::WebSocketStream;
 use worker::*;
+use tokio::time::{timeout, Duration};
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
@@ -96,6 +97,8 @@ mod proxy {
     use base64::{decode_config, URL_SAFE_NO_PAD};
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
     use worker::*;
+    use tokio::time::{timeout, Duration};
+
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
@@ -211,7 +214,7 @@ mod proxy {
         port: u16,
     ) -> Result<()> {
         // connect to remote socket
-        let mut remote_socket = match Socket::builder().connect(target, port){
+         let mut remote_socket = match Socket::builder().connect(target, port){
             Ok(socket) => socket,
             Err(e) =>  {
                   return Err(Error::new(
@@ -239,13 +242,25 @@ mod proxy {
             }
 
         // forward data
-        let copy_result = copy_bidirectional(client_socket, &mut remote_socket).await;
-          _ = remote_socket.shutdown().await;
-          if let Err(e) = copy_result {
-            if e.kind() != ErrorKind::BrokenPipe &&  e.kind() != ErrorKind::ConnectionAborted {
-                 return  Err(Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("forward data between client and remote failed: {}", e),
+        let copy_result = timeout(Duration::from_secs(10), copy_bidirectional(client_socket, &mut remote_socket)).await;
+
+         _ = remote_socket.shutdown().await;
+
+           match copy_result {
+            Ok(copy_res) => {
+                if let Err(e) = copy_res {
+                    if e.kind() != ErrorKind::BrokenPipe && e.kind() != ErrorKind::ConnectionAborted {
+                        return Err(Error::new(
+                            ErrorKind::ConnectionAborted,
+                            format!("forward data between client and remote failed: {}", e),
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "copy_bidirectional timed out",
                 ));
             }
         }
@@ -267,12 +282,13 @@ mod proxy {
         }
 
         // send response header
-        if let Err(e) = client_socket.write(&protocol::RESPONSE).await {
-                return Err(Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("send response header failed: {}", e),
-                ));
-         }
+       if let Err(e) = client_socket.write(&protocol::RESPONSE).await {
+            return Err(Error::new(
+                ErrorKind::ConnectionAborted,
+                format!("send response header failed: {}", e),
+            ));
+        }
+
         // forward data
         loop {
             // read packet length
@@ -282,15 +298,16 @@ mod proxy {
              }
             let length = length.unwrap();
             if length == 0 {
-              return Ok(());
-            }
+                 return Ok(());
+             }
              // read dns packet
              let packet = match client_socket.read_bytes(length as usize).await{
               Ok(packet) => packet,
               Err(_) => return Ok(())
-            };
+             };
+            
             // create request
-            let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
+             let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
                 // create request
                 let mut init = RequestInit::new();
                 init.method = Method::Post;
@@ -303,36 +320,50 @@ mod proxy {
                 init
             })
             .unwrap();
+             
+           let response_result = timeout(Duration::from_secs(5), Fetch::Request(request).send()).await;
 
-            // invoke dns-over-http resolver
-              let mut response = match Fetch::Request(request).send().await {
-                  Ok(response) => response,
-                   Err(e) => {
-                      console_error!("send DNS-over-HTTP request failed: {}", e);
-                       continue
-                  }
-              };
-              
-
-            // read response
-            let data = match response.bytes().await {
-              Ok(data) => data,
-              Err(e) => {
-                   console_error!("DNS-over-HTTP response body error: {}", e);
-                 continue;
+          let response = match response_result{
+              Ok(response) => {
+                 match response {
+                    Ok(response) => response,
+                    Err(e) =>{
+                        console_error!("send DNS-over-HTTP request failed: {}", e);
+                         return Ok(());
+                    }
+                 }
               }
-            };
+              Err(e) => {
+                    console_error!("send DNS-over-HTTP request timed out: {}", e);
+                    return Ok(());
+              }
+          };
 
-            // write response
+          let data = match timeout(Duration::from_secs(5), response.bytes()).await {
+             Ok(data) => {
+                match data {
+                    Ok(data) => data,
+                    Err(e) =>{
+                        console_error!("DNS-over-HTTP response body error: {}", e);
+                        return Ok(());
+                    }
+                }
+             },
+             Err(e) => {
+                   console_error!("DNS-over-HTTP response body timed out: {}", e);
+                   return Ok(());
+              }
+          };
+             // write response
             if let Err(e) = client_socket.write_u16(data.len() as u16).await{
-                 console_error!("write udp length failed: {}", e);
-                continue;
+                console_error!("write udp length failed: {}", e);
+                 return Ok(());
              }
               if let Err(e) = client_socket.write_all(&data).await {
                    console_error!("write udp data failed: {}", e);
-                 continue;
-              }
-        }
+                   return Ok(());
+             }
+         }
     }
 }
 
