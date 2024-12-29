@@ -211,38 +211,38 @@ mod proxy {
         port: u16,
     ) -> Result<()> {
         // connect to remote socket
-        let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
-            Error::new(
-                ErrorKind::ConnectionAborted,
-                format!("connect to remote failed: {}", e),
-            )
-        })?;
-
-         // check remote socket
-        remote_socket.opened().await.map_err(|e| {
-            Error::new(
+        let mut remote_socket = match Socket::builder().connect(target, port).await{
+            Ok(socket) => socket,
+            Err(e) =>  {
+                  return Err(Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("connect to remote failed: {}", e),
+                ))
+             }
+        };
+        // check remote socket
+        if let Err(e) =  remote_socket.opened().await {
+              _ = remote_socket.close();
+             return Err(Error::new(
                 ErrorKind::ConnectionReset,
                 format!("remote socket not opened: {}", e),
-            )
-        })?;
-
+            ));
+         }
 
         // send response header
-        client_socket
-            .write(&protocol::RESPONSE)
-            .await
-            .map_err(|e| {
-                Error::new(
+        if let Err(e) = client_socket.write(&protocol::RESPONSE).await{
+                _ = remote_socket.close();
+                 return Err(Error::new(
                     ErrorKind::ConnectionAborted,
                     format!("send response header failed: {}", e),
-                )
-            })?;
+                ));
+            }
 
         // forward data
-         let copy_result = copy_bidirectional(client_socket, &mut remote_socket).await;
-        
-        if let Err(e) = copy_result {
-            if e.kind() != ErrorKind::BrokenPipe &&  e.kind() != ErrorKind::ConnectionAborted{
+        let copy_result = copy_bidirectional(client_socket, &mut remote_socket).await;
+          _ = remote_socket.shutdown().await;
+          if let Err(e) = copy_result {
+            if e.kind() != ErrorKind::BrokenPipe &&  e.kind() != ErrorKind::ConnectionAborted {
                  return  Err(Error::new(
                     ErrorKind::ConnectionAborted,
                     format!("forward data between client and remote failed: {}", e),
@@ -267,33 +267,30 @@ mod proxy {
         }
 
         // send response header
-        client_socket
-            .write(&protocol::RESPONSE)
-            .await
-             .map_err(|e| {
-                Error::new(
+        if let Err(e) = client_socket.write(&protocol::RESPONSE).await {
+                return Err(Error::new(
                     ErrorKind::ConnectionAborted,
                     format!("send response header failed: {}", e),
-                )
-            })?;
-
-
+                ));
+         }
         // forward data
         loop {
             // read packet length
             let length = client_socket.read_u16().await;
-            if length.is_err() {
+             if let Err(_) = length {
                return Ok(());
-            }
+             }
             let length = length.unwrap();
             if length == 0 {
-                return Ok(());
+              return Ok(());
             }
              // read dns packet
-            let packet = client_socket.read_bytes(length as usize).await?;
-
+             let packet = match client_socket.read_bytes(length as usize).await{
+              Ok(packet) => packet,
+              Err(_) => return Ok(())
+            };
             // create request
-             let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
+            let request = Request::new_with_init("https://1.1.1.1/dns-query", &{
                 // create request
                 let mut init = RequestInit::new();
                 init.method = Method::Post;
@@ -308,24 +305,33 @@ mod proxy {
             .unwrap();
 
             // invoke dns-over-http resolver
-             let mut response = Fetch::Request(request).send().await.map_err(|e| {
-                Error::new(
-                     ErrorKind::ConnectionAborted,
-                    format!("send DNS-over-HTTP request failed: {}", e),
-                )
-            })?;
+              let mut response = match Fetch::Request(request).send().await {
+                  Ok(response) => response,
+                   Err(e) => {
+                      console_error!("send DNS-over-HTTP request failed: {}", e);
+                       continue
+                  }
+              };
+              
 
             // read response
-            let data = response.bytes().await.map_err(|e| {
-                Error::new(
-                    ErrorKind::ConnectionAborted,
-                     format!("DNS-over-HTTP response body error: {}", e),
-                )
-            })?;
-            
+            let data = match response.bytes().await {
+              Ok(data) => data,
+              Err(e) => {
+                   console_error!("DNS-over-HTTP response body error: {}", e);
+                 continue;
+              }
+            };
+
             // write response
-            client_socket.write_u16(data.len() as u16).await?;
-            client_socket.write_all(&data).await?;
+            if let Err(e) = client_socket.write_u16(data.len() as u16).await{
+                 console_error!("write udp length failed: {}", e);
+                continue;
+             }
+              if let Err(e) = client_socket.write_all(&data).await {
+                   console_error!("write udp data failed: {}", e);
+                 continue;
+              }
         }
     }
 }
