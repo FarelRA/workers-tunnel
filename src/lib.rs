@@ -320,7 +320,7 @@ mod proxy {
             })
             .unwrap();
              
-           let response_result = timeout(Duration::from_secs(5), Fetch::Request(request).send()).await;
+           let response_result = timeout(Duration::from_secs(5),  Fetch::Request(request).send()).await;
 
           let response = match response_result{
               Ok(response) => {
@@ -339,7 +339,7 @@ mod proxy {
           };
            
          
-          let data = match timeout(Duration::from_secs(5), response.bytes().await).await {
+          let data = match timeout(Duration::from_secs(5), response.bytes()).await {
              Ok(data) => {
                 match data {
                     Ok(data) => data,
