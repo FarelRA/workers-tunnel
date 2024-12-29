@@ -4,6 +4,17 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
+    // Handle errors gracefully and ensure a response is always generated
+    match handle_request(req, env).await {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            console_error!("Error handling request: {}", e);
+            Response::error(e.to_string(), 500)
+        }
+    }
+}
+
+async fn handle_request(req: Request, env: Env) -> Result<Response> {
     // get user id
     let user_id = env.var("USER_ID")?.to_string();
     let user_id = parse_user_id(&user_id);
@@ -16,46 +27,48 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
 
-    // better disguising
-    let fallback_site = match env.var("FALLBACK_SITE") {
-        Ok(f) => f.to_string(),
-        Err(_) => String::from(""),
-    };
-    let should_fallback = match req.headers().get("Upgrade")? {
-        Some(up) => up != *"websocket",
-        None => true,
-    };
-    if should_fallback && !fallback_site.is_empty() {
-        let req = Fetch::Url(Url::parse(&fallback_site)?);
-        return req.send().await;
+    // Check if it's a WebSocket upgrade request
+    let is_websocket = req.headers()
+        .get("Upgrade")?
+        .map_or(false, |up| up.to_lowercase() == "websocket");
+
+    // Handle fallback site
+    let fallback_site = env.var("FALLBACK_SITE").ok().map(|f| f.to_string());
+    if !is_websocket {
+        if let Some(site) = fallback_site {
+            let req = Fetch::Url(Url::parse(&site)?);
+            return req.send().await.map_err(|e| Error::from(e));
+        }
+        return Response::error("Bad Request", 400);
     }
 
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
-    // Accept / handle a websocket connection
-    let WebSocketPair { client, server } = WebSocketPair::new()?;
+    // Accept websocket connection
+    let pair = WebSocketPair::new()?;
+    let server = pair.server;
+    let client = pair.client;
+
+    // Accept the connection before spawning the handler
     server.accept()?;
 
+    // Spawn the WebSocket handler
     wasm_bindgen_futures::spawn_local(async move {
-        // create websocket stream
         let socket = WebSocketStream::new(
             &server,
             server.events().expect("could not open stream"),
             early_data,
         );
 
-        // into tunnel
         if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
-            // log error
-            console_error!("error: {}", err);
-
-            // close websocket connection
-            _ = server.close(Some(1003), Some("invalid request"));
+            console_error!("Tunnel error: {}", err);
+            let _ = server.close(Some(1011), Some(&err.to_string()));
         }
     });
 
+    // Return the client socket response immediately
     Response::from_websocket(client)
 }
 
