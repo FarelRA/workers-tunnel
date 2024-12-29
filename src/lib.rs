@@ -404,7 +404,7 @@ mod websocket {
              // Then try to get new data
              match futures_util::ready!(std::pin::Pin::new(&mut futures_util::future::poll_fn(|cx| {
                 Box::pin(self.process_message()).as_mut().poll(cx)
-            })) {
+            }))) {
                 Ok(Some(data)) => {
                     buf.put_slice(&data);
                     Poll::Ready(Ok(()))
