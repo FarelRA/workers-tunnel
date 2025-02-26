@@ -7,10 +7,18 @@ command = "cargo install -q worker-build && worker-build --release"
 
 [observability]
 enabled = true
-head_sampling_rate = 1
 
 [vars]
-USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c" # your uuid
-PROXY_IP = "" # proxyip.fxxk.dedyn.io
-FALLBACK_SITE = "" # https://httpbin.org/status/404
-SHOW_URI = "true" # show vless uri in /UUID path
+# Used to authenticate with the V2Ray/Xray client.
+# Set USER_ID in Cloudflare Secrets instead of hardcoding it here.
+# USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+
+# Proxy IP to connect to the Cloudflare Network.
+# Cloudflare Workers prohibit direct socket connections to Cloudflare IPs.
+PROXY_IP = "gh.proxy.farelra.my.id"
+
+# Fallback site when accessed outside the V2Ray/Xray client.
+FALLBACK_SITE = "farelra.my.id"
+
+# Determines whether to display the VLESS Template URI at /{UUID} path.
+SHOW_URI = "true"
