@@ -1,6 +1,7 @@
 [package]
 name = "worker-rust"
 version = "0.1.1"
+edition = "2024"
 
 # https://github.com/rustwasm/wasm-pack/issues/1247
 #[package.metadata.wasm-pack.profile.release]
