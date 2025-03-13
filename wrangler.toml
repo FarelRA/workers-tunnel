@@ -11,14 +11,14 @@ enabled = true
 [vars]
 # Used to authenticate with the V2Ray/Xray client.
 # Set USER_ID in Cloudflare Secrets instead of hardcoding it here.
-# USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+#USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
 
 # Proxy IP to connect to the Cloudflare Network.
 # Cloudflare Workers prohibit direct socket connections to Cloudflare IPs.
 PROXY_IP = "gh.proxy.farelra.my.id"
 
 # Fallback site when accessed outside the V2Ray/Xray client.
-FALLBACK_SITE = "farelra.my.id"
+FALLBACK_SITE = "https://farelra.my.id/"
 
 # Determines whether to display the VLESS Template URI at /{UUID} path.
 SHOW_URI = "true"
