@@ -1,6 +1,6 @@
 # Workers Tunnel
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zhu327/workers-tunnel/tree/main)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/FarelRA/workers-tunnel/tree/main)
 
 **Workers Tunnel** is an edge network tunnel powered by Cloudflare Workers, allowing traffic to be securely proxied through the Cloudflare network. This solution is particularly useful for users who need reliable connectivity while bypassing restrictions.
 
