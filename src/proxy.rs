@@ -2,11 +2,12 @@ mod proxy {
     use std::sync::Arc;
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
-
     use crate::ext::StreamExt;
     use crate::protocol;
     use crate::websocket::WebSocketStream;
+    use base64::{decode_config, engine::general_purpose::URL_SAFE_NO_PAD};
     use hex::FromHexError;
+    use worker::Socket;
 
     pub struct TunnelConfig {
         pub user_id: Vec<u8>,
@@ -19,7 +20,7 @@ mod proxy {
         if let Some(data) = data {
             if !data.is_empty() {
                 let s = data.replace('+', "-").replace('/', "_").replace('=', "");
-                return decode_config(&s, base64::URL_SAFE_NO_PAD)
+                return decode_config(&s, URL_SAFE_NO_PAD)
                     .map(|d| Some(d))
                     .map_err(|e| Error::new(ErrorKind::Other, e.to_string()));
             }
@@ -31,8 +32,8 @@ mod proxy {
         hex::decode(user_id)
     }
 
-    pub async fn run_tunnel(
-        mut client_socket: WebSocketStream<'_>,
+    pub async fn run_tunnel<'a>(
+        mut client_socket: WebSocketStream<'a>,
         config: Arc<TunnelConfig>,
     ) -> Result<()> {
         // read version
@@ -71,7 +72,10 @@ mod proxy {
         // process outbound
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
-                for target in std::iter::once(&remote_addr).chain(config.proxy_ip.iter().map(|s| s.as_str())) {
+                let targets = std::iter::once(&remote_addr)
+                    .chain(config.proxy_ip.iter().map(|s| s.as_str()))
+                    .collect::<Vec<&str>>();
+                for target in targets {
                     if let Ok(()) = process_tcp_outbound(&mut client_socket, target, remote_port).await {
                         return Ok(());
                     }
@@ -90,7 +94,7 @@ mod proxy {
         target: &str,
         port: u16,
     ) -> Result<()> {
-        let mut remote_socket = Socket::connect(target, port).await?; // Updated API
+        let mut remote_socket = Socket::connect(target, port).await?;
         client_socket.write(&protocol::RESPONSE).await?;
         tokio::io::copy_bidirectional(client_socket, &mut remote_socket).await?;
         Ok(())
@@ -107,7 +111,6 @@ mod proxy {
 
         client_socket.write(&protocol::RESPONSE).await?;
 
-        // forward data
         loop {
             let length = client_socket.read_u16().await?;
             let packet = client_socket.read_bytes(length as usize).await?;

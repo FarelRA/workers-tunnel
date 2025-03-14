@@ -1,7 +1,3 @@
-mod proxy;
-mod ext;
-mod websocket;
-
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel, TunnelConfig};
 use crate::websocket::WebSocketStream;
 use wasm_bindgen::JsValue;
@@ -11,9 +7,10 @@ use std::sync::Arc;
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let config = Arc::new(TunnelConfig {
-        user_id: parse_user_id(&env.var("USER_ID")?.to_string()),
+        user_id: parse_user_id(&env.var("USER_ID")?.to_string())?,
         proxy_ip: env
             .var("PROXY_IP")?
+            .to_string()
             .split_ascii_whitespace()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
@@ -24,8 +21,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
             .to_string(),
         show_uri: env
             .var("SHOW_URI")?
-            .parse()
-            .unwrap_or(false),
+            .parse()?,
     });
 
     let is_websocket = req
@@ -41,7 +37,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
             let host_str = req.url()?.host_str().ok_or("Invalid host")?;
             return Response::ok(format!(
                 "vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=ws#workers-tunnel",
-                uuid = config.user_id.to_hex(),
+                uuid = hex::encode(&config.user_id),
                 host = host_str
             ));
         }
@@ -80,7 +76,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
         if let Err(err) = run_tunnel(socket, Arc::clone(&config)).await {
             console_error!("Error: {}", err);
-            _ = server.close_with_code(1003, "Invalid request");
+            _ = server.close_with(1003, "Invalid request");
         }
     });
 

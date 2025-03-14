@@ -3,7 +3,6 @@ mod websocket {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use bytes::{BufMut, BytesMut};
-    use futures_util::Stream;
     use pin_project::pin_project;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use worker::{EventStream, WebSocket, WebsocketEvent};
@@ -43,36 +42,33 @@ mod websocket {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
             let this = self.project();
-            let remaining = buf.remaining();
+            loop {
+                if !this.buffer.is_empty() {
+                    let amt = std::cmp::min(this.buffer.len(), buf.remaining());
+                    buf.put_slice(&this.buffer.split_to(amt));
+                    return Poll::Ready(Ok(()));
+                }
 
-            if !this.buffer.is_empty() {
-                let take = std::cmp::min(this.buffer.len(), remaining);
-                buf.put_slice(&this.buffer.split_to(take));
-                return Poll::Ready(Ok(()));
-            }
+                if *this.closed {
+                    return Poll::Ready(Ok(()));
+                }
 
-            if *this.closed {
-                return Poll::Ready(Ok(()));
-            }
-
-            match this.stream.as_mut().poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                    if let Some(data) = msg.bytes() {
-                        this.buffer.put_slice(&data);
-                        self.poll_read(cx, buf)
-                    } else {
-                        Poll::Pending
+                match this.stream.as_mut().poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
+                        if let Some(data) = msg.bytes() {
+                            this.buffer.put_slice(&data);
+                        }
                     }
+                    Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
+                        *this.closed = true;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                    }
+                    _ => return Poll::Ready(Ok(())),
                 }
-                Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                    *this.closed = true;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
-                }
-                _ => Poll::Ready(Ok(())),
             }
         }
     }
@@ -85,7 +81,10 @@ mod websocket {
         ) -> Poll<Result<usize>> {
             let this = self.project();
             if *this.closed {
-                return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "socket closed")));
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "socket already closed",
+                )));
             }
             if let Err(e) = this.ws.send_with_bytes(buf) {
                 return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
@@ -93,10 +92,7 @@ mod websocket {
             Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-        ) -> Poll<Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
             let this = self.project();
             if *this.closed {
                 return Poll::Ready(Err(Error::new(
@@ -111,7 +107,7 @@ mod websocket {
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
         ) -> Poll<Result<()>> {
-            let this = self.project();
+            let mut this = self.project();
             if !*this.closed {
                 if let Err(e) = this.ws.close(None, Some("normal close")) {
                     return Poll::Ready(Err(Error::new(

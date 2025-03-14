@@ -1,9 +1,9 @@
-mod ext {
-    use std::io::Result;
-    use tokio::io::AsyncReadExt;
+pub mod ext {
+    use std::io::{Error, ErrorKind, Result};
     use bytes::Buf;
+    use tokio::io::{AsyncReadExt, AsyncRead};
 
-    pub trait StreamExt: AsyncReadExt + Unpin {
+    pub trait StreamExt: AsyncRead + Unpin {
         async fn read_u8(&mut self) -> Result<u8> {
             let mut buf = [0u8; 1];
             self.read_exact(&mut buf).await?;
@@ -30,7 +30,7 @@ mod ext {
 
         async fn read_string(&mut self, n: usize) -> Result<String> {
             let bytes = self.read_bytes(n).await?;
-            String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            String::from_utf8(bytes).map_err(|e| Error::new(ErrorKind::InvalidData, e))
         }
 
         async fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
