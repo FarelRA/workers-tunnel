@@ -1,3 +1,6 @@
+mod proxy;
+mod websocket;
+
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel, TunnelConfig};
 use crate::websocket::WebSocketStream;
 use wasm_bindgen::JsValue;
@@ -21,6 +24,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
             .to_string(),
         show_uri: env
             .var("SHOW_URI")?
+            .to_string()
             .parse()?,
     });
 
@@ -76,7 +80,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
         if let Err(err) = run_tunnel(socket, Arc::clone(&config)).await {
             console_error!("Error: {}", err);
-            _ = server.close_with(1003, "Invalid request");
+            _ = server.close(1003, "Invalid request");
         }
     });
 

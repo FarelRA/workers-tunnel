@@ -1,4 +1,8 @@
 mod proxy {
+    mod ext;
+    mod protocol;
+    mod websocket;
+
     use std::sync::Arc;
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
