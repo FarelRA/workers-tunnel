@@ -66,7 +66,8 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
-    let (client, server) = req.accept_websocket()?; // Updated for worker 0.6
+    // Accept / handle a websocket connection
+    let WebSocketPair { client, server } = WebSocketPair::new()?;
     server.accept()?;
 
     wasm_bindgen_futures::spawn_local(async move {
